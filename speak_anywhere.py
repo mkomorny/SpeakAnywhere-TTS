@@ -658,6 +658,11 @@ def load_settings():
         "active_key_id": None,
         "cartesia_model": DEFAULT_CARTESIA_MODEL,
         "kokoro_voice": "af_bella",
+        "save_audio_auto": False,
+        "save_audio_format": DEFAULT_AUDIO_FORMAT,
+        "save_audio_dir": "",
+        "save_audio_ask": True,
+        "save_audio_last_dir": "",
     }
     if SETTINGS_FILE.is_file():
         try:
@@ -672,6 +677,47 @@ def save_settings(data):
         SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  AUDIO EXPORT (save generated speech to a file)
+# ──────────────────────────────────────────────────────────────────────
+_ALL_AUDIO_FORMATS = {
+    "WAV · 16-bit PCM":   ("WAV", "PCM_16", "wav"),
+    "WAV · 32-bit float": ("WAV", "FLOAT", "wav"),
+    "FLAC · lossless":    ("FLAC", "PCM_16", "flac"),
+    "OGG · Vorbis":       ("OGG", "VORBIS", "ogg"),
+    "MP3":                ("MP3", None, "mp3"),
+}
+try:
+    _avail = sf.available_formats()
+except Exception:
+    _avail = {"WAV": ""}
+AUDIO_FORMATS = {k: v for k, v in _ALL_AUDIO_FORMATS.items() if v[0] in _avail}
+DEFAULT_AUDIO_FORMAT = "WAV · 16-bit PCM"
+
+
+def default_audio_dir():
+    return Path.home() / "Music" / "SpeakAnywhere"
+
+
+def audio_filename(text, voice, ext):
+    words = re.findall(r"[A-Za-z0-9]+", text)[:6]
+    slug = "-".join(words)[:40] or "speech"
+    vtag = re.sub(r"[^A-Za-z0-9]+", "", voice.split(":")[0] if voice.startswith(CARTESIA_PREFIX) else voice)[:12]
+    return f"{time.strftime('%Y-%m-%d_%H-%M-%S')}_{slug}_{vtag}.{ext}"
+
+
+def write_audio(samples, sr, dest_dir, fmt_label, text, voice, dest_path=None):
+    """Write float32 samples to disk in the chosen format; returns the Path written."""
+    fmt, subtype, ext = AUDIO_FORMATS.get(fmt_label, AUDIO_FORMATS[next(iter(AUDIO_FORMATS))])
+    if dest_path is None:
+        d = Path(dest_dir) if dest_dir else default_audio_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        dest_path = d / audio_filename(text, voice, ext)
+    data = np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
+    sf.write(str(dest_path), data, int(sr), format=fmt, subtype=subtype)
+    return Path(dest_path)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1499,6 +1545,9 @@ class SpeakAnywhereApp:
         def open_settings(icon=None, item=None):
             self.msg_queue.put(("open_settings",))
 
+        def do_save_last(icon=None, item=None):
+            self.msg_queue.put(("save_last_audio",))
+
         def do_shuffle(icon=None, item=None):
             self.msg_queue.put(("shuffle_theme",))
 
@@ -1508,6 +1557,7 @@ class SpeakAnywhereApp:
         tray_menu = pystray.Menu(
             item("Show / Hide HUD", toggle_hud, default=True),
             item("Read Clipboard", read_cb),
+            item("Save Last Reading as Audio", do_save_last),
             item("Shuffle Theme (🔀)", do_shuffle),
             pystray.Menu.SEPARATOR,
             item("Keep Docked in System Tray", toggle_dock, checked=lambda it: self.keep_in_tray),
@@ -1608,6 +1658,10 @@ class SpeakAnywhereApp:
                             lambda: self._set_state(self.STATE_READY, "READY")
                             if self.state == self.STATE_READY else None,
                         )
+                elif kind == "audio_saved":
+                    self._on_audio_saved(msg[1], msg[2])
+                elif kind == "save_last_audio":
+                    self._save_last_audio()
                 elif kind == "set_voice":
                     self.settings["voice"] = msg[1]
                     if not msg[1].startswith(CARTESIA_PREFIX):
@@ -1689,6 +1743,7 @@ class SpeakAnywhereApp:
 
     def _generate_and_play(self, text, voice, speed, gen_id):
         chunks = self._split_text(text, max_chars=400)
+        parts, out_sr = [], 24000
         for i, chunk in enumerate(chunks):
             if gen_id != self._current_gen_id or self.state not in (self.STATE_GENERATING, self.STATE_SPEAKING):
                 return
@@ -1709,6 +1764,8 @@ class SpeakAnywhereApp:
                     samples, sr = self.tts.speak(chunk, voice=voice, speed=speed)
                 if gen_id != self._current_gen_id or self.state not in (self.STATE_GENERATING, self.STATE_SPEAKING):
                     return
+                parts.append(samples)
+                out_sr = sr
                 self.msg_queue.put(("state", self.STATE_SPEAKING, f"PLAY {i+1}/{len(chunks)}"))
                 self.player.play(samples, sr)
             except Exception as e:
@@ -1717,7 +1774,76 @@ class SpeakAnywhereApp:
                 return
 
         if gen_id == self._current_gen_id:
+            if parts:
+                self.last_audio = (np.concatenate(parts), out_sr, text, voice)
+                if self.settings.get("save_audio_auto"):
+                    self._save_audio_async(self.last_audio)
+                    return
             self.msg_queue.put(("state", self.STATE_READY, "READY"))
+
+    # ── Save generated speech to a file ──
+    def _save_audio_async(self, audio, dest_path=None):
+        threading.Thread(target=self._save_audio, args=(audio, dest_path), daemon=True).start()
+
+    def _save_audio(self, audio, dest_path=None):
+        samples, sr, text, voice = audio
+        try:
+            path = write_audio(samples, sr, self.settings.get("save_audio_dir") or "",
+                               self.settings.get("save_audio_format", DEFAULT_AUDIO_FORMAT), text, voice, dest_path)
+            log_event(f"audio saved: {path.name} ({path.stat().st_size // 1024} KB)")
+            self.msg_queue.put(("audio_saved", str(path), ""))
+        except Exception as e:
+            log_event(f"audio save failed: {type(e).__name__}: {e}")
+            self.msg_queue.put(("audio_saved", "", f"{type(e).__name__}: {e}"))
+
+    def _save_last_audio(self, ask_path=None):
+        """Manual save of the last completed reading. ask_path=None follows the 'ask each time' option."""
+        if not getattr(self, "last_audio", None):
+            self._set_audio_status("Nothing to save yet — read something first", error=True)
+            self._set_state(self.STATE_READY, "NOTHING TO SAVE")
+            self.root.after(2000, lambda: self._set_state(self.STATE_READY, "READY") if self.state == self.STATE_READY else None)
+            return
+        if ask_path is None:
+            ask_path = bool(self.settings.get("save_audio_ask", True))
+        dest = None
+        if ask_path:
+            from tkinter import filedialog
+            fmt, _sub, ext = AUDIO_FORMATS.get(self.settings.get("save_audio_format"), AUDIO_FORMATS[DEFAULT_AUDIO_FORMAT])
+            start = (self.settings.get("save_audio_last_dir") or self.settings.get("save_audio_dir")
+                     or str(default_audio_dir()))
+            if not Path(start).is_dir():
+                start = str(Path.home())
+            topmost = self.panel.attributes("-topmost") if self.panel and self.panel.winfo_exists() else False
+            try:
+                if self.panel and self.panel.winfo_exists():
+                    self.panel.attributes("-topmost", False)
+                dest = filedialog.asksaveasfilename(
+                    parent=self.panel if self.panel and self.panel.winfo_exists() else self.root,
+                    title="Save speech as…", initialdir=start, defaultextension="." + ext,
+                    initialfile=audio_filename(self.last_audio[2], self.last_audio[3], ext),
+                    filetypes=[(f"{fmt} audio", "*." + ext), ("All files", "*.*")])
+            finally:
+                if self.panel and self.panel.winfo_exists():
+                    self.panel.attributes("-topmost", bool(topmost))
+            if not dest:
+                self._set_audio_status("Save cancelled")
+                return
+            self.settings["save_audio_last_dir"] = os.path.dirname(dest)
+            save_settings(self.settings)
+        self._set_audio_status("Saving…")
+        self._save_audio_async(self.last_audio, dest)
+
+    def _on_audio_saved(self, path, err):
+        if path:
+            name = Path(path).name
+            self._set_state(self.STATE_READY, "SAVED ✓")
+            self.root.after(2200, lambda: self._set_state(self.STATE_READY, "READY") if self.state == self.STATE_READY else None)
+            self._set_audio_status(f"Saved: {name}")
+            self._last_saved_path = path
+        else:
+            self._set_state(self.STATE_READY, "SAVE FAILED")
+            self.root.after(2500, lambda: self._set_state(self.STATE_READY, "READY") if self.state == self.STATE_READY else None)
+            self._set_audio_status(f"Save failed: {err}", error=True)
 
     def _stop_speaking(self):
         self._current_gen_id += 1
@@ -1873,6 +1999,11 @@ class SpeakAnywhereApp:
         btn_test.bind("<Enter>", lambda e: btn_test.configure(bg=self.bg_hover))
         btn_test.bind("<Leave>", lambda e: btn_test.configure(bg=self.bg_panel))
 
+        # Save generated speech as audio (collapsible)
+        self.audio_frame = tk.Frame(pf, bg=self.bg)
+        self.audio_frame.pack(anchor="w", fill="x")
+        self._build_audio_ui()
+
         # Hotkey Info
         div = tk.Frame(pf, bg=self.border, height=1)
         div.pack(fill="x", pady=(2, 6))
@@ -1883,6 +2014,106 @@ class SpeakAnywhereApp:
                  font=FONT_SM, fg=self.fg_muted, bg=self.bg).pack(anchor="w", pady=(2, 0))
         tk.Label(pf, text="Or click ▶ READ / use Chrome / tray Read Clipboard",
                  font=FONT_SM, fg=self.fg_muted, bg=self.bg).pack(anchor="w", pady=(2, 0))
+
+    def _build_audio_ui(self):
+        fr = self.audio_frame
+        for w in fr.winfo_children():
+            w.destroy()
+        open_ = getattr(self, "_audio_open", False)
+        hdr = tk.Label(fr, text=("▾ SAVE AUDIO" if open_ else "▸ SAVE AUDIO"), font=FONT_SM,
+                       fg=self.accent, bg=self.bg, cursor="hand2")
+        hdr.pack(anchor="w", pady=(0, 4))
+        hdr.bind("<Button-1>", lambda e: self._toggle_audio_section())
+        self.audio_status = tk.Label(fr, text=getattr(self, "_audio_status_text", ""), font=FONT_SM,
+                                     fg=self.fg_muted, bg=self.bg, anchor="w", wraplength=300, justify="left")
+        if open_:
+            box = tk.Frame(fr, bg=self.bg_panel, padx=6, pady=6, relief="solid", bd=1)
+            box.pack(anchor="w", fill="x", pady=(0, 6))
+
+            self.auto_save_var = tk.BooleanVar(value=bool(self.settings.get("save_audio_auto")))
+            tk.Checkbutton(box, text="Auto-save every reading", variable=self.auto_save_var, font=FONT_SM,
+                           fg=self.fg, bg=self.bg_panel, selectcolor=self.bg, activebackground=self.bg_panel,
+                           activeforeground=self.accent, command=self._on_audio_opts_change).pack(anchor="w", pady=(0, 6))
+
+            self.ask_save_var = tk.BooleanVar(value=bool(self.settings.get("save_audio_ask", True)))
+            tk.Checkbutton(box, text="Ask where to save each time (manual saves)", variable=self.ask_save_var,
+                           font=FONT_SM, fg=self.fg, bg=self.bg_panel, selectcolor=self.bg,
+                           activebackground=self.bg_panel, activeforeground=self.accent,
+                           command=self._on_audio_opts_change).pack(anchor="w", pady=(0, 6))
+
+            tk.Label(box, text="FORMAT:", font=FONT_SM, fg=self.fg_muted, bg=self.bg_panel).pack(anchor="w")
+            self.audio_fmt_var = tk.StringVar(value=self.settings.get("save_audio_format", DEFAULT_AUDIO_FORMAT))
+            fcombo = ttk.Combobox(box, textvariable=self.audio_fmt_var, values=list(AUDIO_FORMATS), state="readonly",
+                                  width=26, style="Cyber.TCombobox")
+            fcombo.pack(anchor="w", pady=(2, 6))
+            fcombo.bind("<<ComboboxSelected>>", lambda e: self._on_audio_opts_change())
+
+            tk.Label(box, text="DEFAULT / AUTO-SAVE FOLDER:", font=FONT_SM, fg=self.fg_muted, bg=self.bg_panel).pack(anchor="w")
+            self.audio_dir_var = tk.StringVar(value=self.settings.get("save_audio_dir") or str(default_audio_dir()))
+            ent = tk.Entry(box, textvariable=self.audio_dir_var, width=34, font=FONT_SM, fg=self.fg, bg=self.bg,
+                           insertbackground=self.accent, relief="solid", bd=1)
+            ent.pack(anchor="w", pady=(2, 4), ipady=2)
+            self._focus_entry(ent)
+            ent.bind("<Return>", lambda e: self._on_audio_opts_change())
+            ent.bind("<FocusOut>", lambda e: self._on_audio_opts_change())
+            row = tk.Frame(box, bg=self.bg_panel)
+            row.pack(anchor="w", pady=(0, 6))
+            self._cart_btn(row, "BROWSE…", self._browse_audio_dir).pack(side="left", padx=(0, 4))
+            self._cart_btn(row, "OPEN FOLDER", self._open_audio_dir).pack(side="left")
+
+            row2 = tk.Frame(box, bg=self.bg_panel)
+            row2.pack(anchor="w")
+            self._cart_btn(row2, "💾 SAVE LAST…", lambda: self._save_last_audio(None)).pack(side="left", padx=(0, 4))
+            self._cart_btn(row2, "SAVE AS…", lambda: self._save_last_audio(True)).pack(side="left")
+            tk.Label(box, text="Auto-save always uses the folder above.\nSAVE AS… always asks. Files: date_time_text_voice.ext",
+                     justify="left", font=FONT_SM,
+                     fg=self.fg_muted, bg=self.bg_panel).pack(anchor="w", pady=(6, 0))
+        self.audio_status.pack(anchor="w", pady=(0, 6))
+
+    def _toggle_audio_section(self):
+        self._audio_open = not getattr(self, "_audio_open", False)
+        self._build_audio_ui()
+
+    def _set_audio_status(self, text, error=False):
+        self._audio_status_text = text
+        try:
+            if self.panel and self.panel.winfo_exists() and self.audio_status.winfo_exists():
+                self.audio_status.configure(text=text, fg=("#ff5555" if error else self.fg))
+        except Exception:
+            pass
+
+    def _on_audio_opts_change(self):
+        self.settings["save_audio_auto"] = bool(self.auto_save_var.get())
+        self.settings["save_audio_ask"] = bool(self.ask_save_var.get())
+        self.settings["save_audio_format"] = self.audio_fmt_var.get()
+        d = self.audio_dir_var.get().strip()
+        self.settings["save_audio_dir"] = "" if d == str(default_audio_dir()) else d
+        save_settings(self.settings)
+        log_event(f"audio options: auto={self.settings['save_audio_auto']} fmt={self.settings['save_audio_format']}")
+
+    def _browse_audio_dir(self):
+        from tkinter import filedialog
+        topmost = self.panel.attributes("-topmost") if self.panel and self.panel.winfo_exists() else False
+        try:
+            if self.panel and self.panel.winfo_exists():
+                self.panel.attributes("-topmost", False)
+            d = filedialog.askdirectory(parent=self.panel if self.panel and self.panel.winfo_exists() else self.root,
+                                        title="Choose a folder for saved audio",
+                                        initialdir=self.audio_dir_var.get() or str(default_audio_dir()))
+        finally:
+            if self.panel and self.panel.winfo_exists():
+                self.panel.attributes("-topmost", bool(topmost))
+        if d:
+            self.audio_dir_var.set(os.path.normpath(d))
+            self._on_audio_opts_change()
+
+    def _open_audio_dir(self):
+        d = Path(self.audio_dir_var.get().strip() or default_audio_dir())
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(d))
+        except Exception as e:
+            self._set_audio_status(f"Can't open folder: {e}", error=True)
 
     def _close_panel(self):
         if self.panel and self.panel.winfo_exists():
