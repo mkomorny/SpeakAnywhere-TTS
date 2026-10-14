@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Kokoro Reader Settings</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      width: 290px;
+      background-color: #000000;
+      color: #ffffff;
+      font-family: Consolas, "Courier New", monospace;
+      padding: 14px;
+      border: 1px solid #39ff14;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid #14350b;
+      padding-bottom: 8px;
+      margin-bottom: 12px;
+    }
+    .title {
+      color: #39ff14;
+      font-size: 13px;
+      font-weight: bold;
+      letter-spacing: 0.5px;
+    }
+    .status-badge {
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 2px;
+      font-weight: bold;
+    }
+    .status-online {
+      background: #0a250a;
+      color: #39ff14;
+      border: 1px solid #39ff14;
+    }
+    .status-offline {
+      background: #250a0a;
+      color: #ff3344;
+      border: 1px solid #ff3344;
+    }
+    .field {
+      margin-bottom: 12px;
+    }
+    label {
+      display: block;
+      font-size: 10px;
+      color: #6bb360;
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      font-weight: bold;
+    }
+    select {
+      width: 100%;
+      background: #050805;
+      color: #ffffff;
+      border: 1px solid #14350b;
+      padding: 6px 8px;
+      font-family: Consolas, monospace;
+      font-size: 11px;
+      outline: none;
+      border-radius: 3px;
+    }
+    select:focus {
+      border-color: #39ff14;
+    }
+    .slider-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    input[type="range"] {
+      flex: 1;
+      accent-color: #39ff14;
+    }
+    .speed-val {
+      font-size: 12px;
+      color: #39ff14;
+      font-weight: bold;
+      width: 35px;
+      text-align: right;
+    }
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: #cdd6f4;
+      margin-top: 10px;
+      cursor: pointer;
+    }
+    .checkbox-row input {
+      accent-color: #39ff14;
+      cursor: pointer;
+    }
+    .btn-test {
+      width: 100%;
+      margin-top: 14px;
+      background: #050805;
+      color: #39ff14;
+      border: 1px solid #39ff14;
+      padding: 7px;
+      font-family: Consolas, monospace;
+      font-size: 11px;
+      font-weight: bold;
+      cursor: pointer;
+      border-radius: 3px;
+      transition: all 0.15s ease;
+    }
+    .btn-test:hover {
+      background: #0a250a;
+      box-shadow: 0 0 10px rgba(57, 255, 20, 0.4);
+    }
+    .footer-note {
+      font-size: 9px;
+      color: #6bb360;
+      margin-top: 12px;
+      text-align: center;
+      border-top: 1px solid #14350b;
+      padding-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="title">[KOKORO // AI]</div>
+    <div id="server-status" class="status-badge status-offline">CHECKING...</div>
+  </div>
+
+  <div class="field">
+    <label>Design Theme</label>
+    <div style="display: flex; gap: 8px; align-items: center;">
+      <div id="theme-name" style="flex: 1; font-size: 11px; color: #39ff14; background: #050805; padding: 6px 8px; border: 1px solid #14350b; border-radius: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">OLED Cyberdeck</div>
+      <button type="button" id="btn-shuffle-theme" title="Shuffle theme" style="background: #050805; color: #39ff14; border: 1px solid #39ff14; padding: 5px 8px; font-family: Consolas, monospace; font-size: 10px; font-weight: bold; cursor: pointer; border-radius: 3px;">🔀 SHUFFLE</button>
+    </div>
+  </div>
+
+  <div class="field">
+    <label for="voice-select">Voice Profile</label>
+    <select id="voice-select">
+      <option value="af_bella">🇺🇸 Female — Bella</option>
+      <option value="af">🇺🇸 Female — Default</option>
+      <option value="af_nicole">🇺🇸 Female — Nicole</option>
+      <option value="af_sarah">🇺🇸 Female — Sarah</option>
+      <option value="af_sky">🇺🇸 Female — Sky</option>
+      <option value="am_adam">🇺🇸 Male — Adam</option>
+      <option value="am_michael">🇺🇸 Male — Michael</option>
+      <option value="bf_emma">🇬🇧 Female — Emma</option>
+      <option value="bf_isabella">🇬🇧 Female — Isabella</option>
+      <option value="bm_george">🇬🇧 Male — George</option>
+      <option value="bm_lewis">🇬🇧 Male — Lewis</option>
+    </select>
+  </div>
+
+  <div class="field">
+    <label for="speed-range">Playback Speed</label>
+    <div class="slider-row">
+      <input type="range" id="speed-range" min="0.5" max="2.0" step="0.1" value="1.0">
+      <div class="speed-val" id="speed-val">1.0x</div>
+    </div>
+  </div>
+
+  <label class="checkbox-row">
+    <input type="checkbox" id="selection-btn-toggle" checked>
+    <span>Show button on text selection</span>
+  </label>
+
+  <button class="btn-test" id="btn-test">▶ TEST VOICE</button>
+
+  <div class="footer-note">
+    Highlight text in Chrome → Click "Read with Kokoro"
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.wav
+*.tmp
+.DS_Store
+
+# Local launcher copy of pythonw (recreated by tools/ensure_launcher.ps1)
+SpeakAnywhere.exe
+
+python3*.dll
+vcruntime*.dll
+pyvenv.cfg
+secrets.json
+settings.json
+__pycache__/

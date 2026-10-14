@@ -1,0 +1,102 @@
+/* OLED Cyberdeck Styles for Read with Kokoro */
+
+#kokoro-floating-trigger {
+  position: absolute;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background-color: #000000 !important;
+  color: #39ff14 !important;
+  border: 1px solid #39ff14 !important;
+  border-radius: 4px !important;
+  padding: 5px 10px !important;
+  font-family: Consolas, "Courier New", monospace !important;
+  font-size: 12px !important;
+  font-weight: bold !important;
+  letter-spacing: 0.5px !important;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.8), 0 0 10px rgba(57, 255, 20, 0.35) !important;
+  cursor: pointer !important;
+  user-select: none !important;
+  transition: all 0.15s ease-in-out !important;
+  line-height: 1 !important;
+}
+
+#kokoro-floating-trigger:hover {
+  background-color: #0a200a !important;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.9), 0 0 16px rgba(57, 255, 20, 0.6) !important;
+  transform: translateY(-1px) scale(1.02) !important;
+}
+
+#kokoro-floating-trigger .kokoro-icon {
+  font-size: 13px !important;
+}
+
+/* Floating Audio Player HUD */
+#kokoro-hud-player {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background-color: #000000 !important;
+  border: 1px solid #39ff14 !important;
+  border-radius: 6px !important;
+  padding: 10px 16px !important;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.9), 0 0 16px rgba(57, 255, 20, 0.4) !important;
+  font-family: Consolas, "Courier New", monospace !important;
+  color: #ffffff !important;
+  font-size: 12px !important;
+  animation: kokoro-slide-up 0.25s ease-out;
+}
+
+@keyframes kokoro-slide-up {
+  from {
+    transform: translateY(20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+#kokoro-hud-player .kokoro-badge {
+  color: #6bb360 !important;
+  font-weight: bold !important;
+}
+
+#kokoro-hud-player .kokoro-status {
+  color: #39ff14 !important;
+  font-weight: bold !important;
+}
+
+#kokoro-hud-player button {
+  background: #050805 !important;
+  color: #39ff14 !important;
+  border: 1px solid #14350b !important;
+  border-radius: 3px !important;
+  padding: 4px 8px !important;
+  font-family: Consolas, monospace !important;
+  font-size: 11px !important;
+  font-weight: bold !important;
+  cursor: pointer !important;
+  transition: all 0.1s ease !important;
+}
+
+#kokoro-hud-player button:hover {
+  border-color: #39ff14 !important;
+  background: #0a200a !important;
+}
+
+#kokoro-hud-player button.kokoro-stop-btn {
+  color: #ff3344 !important;
+  border-color: #551118 !important;
+}
+
+#kokoro-hud-player button.kokoro-stop-btn:hover {
+  border-color: #ff3344 !important;
+  background: #200a0a !important;
+}

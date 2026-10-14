@@ -1,0 +1,11 @@
+# SpeakAnywhere — Windows 10/11, Python 3.12+ (tested on 3.14)
+kokoro-onnx
+onnxruntime
+numpy
+sounddevice
+soundfile
+Pillow
+pystray
+keyboard
+uiautomation
+comtypes
