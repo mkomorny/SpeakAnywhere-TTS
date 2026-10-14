@@ -157,7 +157,6 @@
     chrome.runtime.sendMessage({
       action: "speak",
       text: text,
-      voice: settings.voice,
       speed: settings.speed
     }, (response) => {
       if (synthTimeoutTimer) {

@@ -37,7 +37,7 @@ document.addEventListener("DOMContentLoaded", () => {
         }
 
         if (data.voices && typeof data.voices === "object") {
-          const currentVal = voiceSelect.value;
+          const currentVal = data.active_voice || voiceSelect.value;
           voiceSelect.innerHTML = "";
           for (const [key, label] of Object.entries(data.voices)) {
             const opt = document.createElement("option");
@@ -77,6 +77,12 @@ document.addEventListener("DOMContentLoaded", () => {
   // ── Save Voice ──
   voiceSelect.addEventListener("change", () => {
     chrome.storage.local.set({ voice: voiceSelect.value });
+    // The desktop app is the source of truth for the active voice.
+    fetch("http://127.0.0.1:5050/voice", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ voice: voiceSelect.value })
+    }).catch(() => {});
   });
 
   // ── Save Speed ──
@@ -97,15 +103,13 @@ document.addEventListener("DOMContentLoaded", () => {
     btnTest.disabled = true;
 
     try {
-      const voice = voiceSelect.value;
       const speed = parseFloat(speedRange.value);
 
       const res = await fetch("http://127.0.0.1:5050/speak", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          text: `Kokoro neural reader online at ${speed} times speed.`,
-          voice: voice,
+          text: `SpeakAnywhere reader online at ${speed} times speed.`,
           speed: speed
         })
       });

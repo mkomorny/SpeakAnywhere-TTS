@@ -18,7 +18,8 @@ async function sendToDesktopApp(text, voice, speed) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       text: text,
-      voice: voice || settings.voice,
+      // voice omitted on purpose: the desktop app uses its own active voice (Kokoro or Cartesia)
+      ...(voice ? { voice } : {}),
       speed: speed || settings.speed,
       format: "json"
     })

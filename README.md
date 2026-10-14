@@ -15,7 +15,7 @@ SpeakAnywhere is a **standalone desktop app**. It runs beside Live Actions Helpe
 - **Global Hotkey (`Right Alt + O`)**: Opens / brings the HUD to front. Hold Right Alt and tap **O, O** within ~400ms to read the current selection.
 - **"Read with Kokoro" Chrome Extension**: Selection popup, context menu, and voice/theme sync with the local engine on port 5050.
 - **100% Offline & Private**: Local Kokoro model. Zero cloud latency, zero subscriptions.
-- **Optional Cartesia Custom Voices**: Paste a Cartesia API key in Preferences and the app scans your account and adds a **Cartesia Custom Voices** dropdown. The key is stored locally in a git-ignored `secrets.json`; only voices you pick from that dropdown are sent to Cartesia.
+- **Optional Cartesia Custom Voices**: Save API keys in Preferences (**API KEYS** dropdown + collapsible **SAVED KEYS** to save, rename or delete keys). Saving a Cartesia key automatically fetches its usable models and custom voices into **Cartesia Model** and **Cartesia Custom Voices** dropdowns. Keys are stored locally in a git-ignored `secrets.json`; only text you read with a Cartesia voice is sent to Cartesia. The active voice is controlled by the desktop app, so the Chrome extension follows it.
 
 ---
 

@@ -19,6 +19,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 import tkinter as tk
 import winreg
 from tkinter import ttk
@@ -653,7 +654,10 @@ def load_settings():
         "keep_in_tray": True,
         "pin_tray_icon": True,
         "theme": "oled-cyberdeck",
-        "cartesia_voices": [],
+        "cartesia_cache": {},
+        "active_key_id": None,
+        "cartesia_model": DEFAULT_CARTESIA_MODEL,
+        "kokoro_voice": "af_bella",
     }
     if SETTINGS_FILE.is_file():
         try:
@@ -671,30 +675,71 @@ def save_settings(data):
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  CARTESIA (optional cloud voices) — key kept in secrets.json (git-ignored),
-#  never in settings.json, so it can't leak through repo backups.
+#  API KEY VAULT + CARTESIA (optional cloud voices)
+#  Keys live in secrets.json (git-ignored), never in settings.json.
+#  Format: {"keys": [{"id", "name", "provider", "key"}]}
 # ──────────────────────────────────────────────────────────────────────
 SECRETS_FILE = Path(__file__).resolve().parent / "secrets.json"
+LOG_FILE = Path(__file__).resolve().parent / "speakanywhere.log"
 CARTESIA_API = "https://api.cartesia.ai"
 CARTESIA_VERSION = "2025-04-16"
-CARTESIA_MODEL = "sonic-2"
+DEFAULT_CARTESIA_MODEL = "sonic-2"
 CARTESIA_PREFIX = "cartesia:"
+PROVIDERS = ["Cartesia", "Other"]
+# Cartesia has no "list models" endpoint, so each candidate is probed (free: an empty
+# transcript is rejected with 400 if the model exists and 404 "Model not found" if not).
+CARTESIA_MODEL_CANDIDATES = [
+    "sonic-3", "sonic-3-latest", "sonic-2", "sonic-2-latest",
+    "sonic-turbo", "sonic-turbo-latest", "sonic", "sonic-multilingual",
+]
 
-def load_cartesia_key():
-    try:
-        return json.loads(SECRETS_FILE.read_text(encoding="utf-8")).get("cartesia_api_key", "").strip()
-    except Exception:
-        return ""
 
-def save_cartesia_key(key):
-    key = (key or "").strip()
+def log_event(msg):
+    """Tiny diagnostic log (git-ignored). Never log key material."""
     try:
-        if key:
-            SECRETS_FILE.write_text(json.dumps({"cartesia_api_key": key}, indent=2), encoding="utf-8")
-        elif SECRETS_FILE.is_file():
-            SECRETS_FILE.unlink()
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+        if LOG_FILE.stat().st_size > 200_000:
+            LOG_FILE.write_text("".join(LOG_FILE.read_text(encoding="utf-8").splitlines(True)[-500:]), encoding="utf-8")
     except Exception:
         pass
+
+
+def load_keys():
+    """Return the saved key list, migrating the old single-key format if needed."""
+    try:
+        data = json.loads(SECRETS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if "keys" not in data:
+        legacy = (data.get("cartesia_api_key") or "").strip()
+        keys = [{"id": uuid.uuid4().hex[:8], "name": "Cartesia", "provider": "Cartesia", "key": legacy}] if legacy else []
+        save_keys(keys)
+        return keys
+    return [k for k in data["keys"] if k.get("key")]
+
+
+def save_keys(keys):
+    try:
+        tmp = SECRETS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"keys": keys}, indent=2), encoding="utf-8")
+        tmp.replace(SECRETS_FILE)
+        return True
+    except Exception as e:
+        log_event(f"save_keys failed: {type(e).__name__}")
+        return False
+
+
+def find_key(key_id):
+    for k in load_keys():
+        if k["id"] == key_id:
+            return k
+    return None
+
+
+def key_label(k):
+    return f"{k['name']}  ({k['provider']})"
+
 
 def _cartesia_request(path, api_key, body=None, timeout=60):
     import urllib.request
@@ -706,6 +751,7 @@ def _cartesia_request(path, api_key, body=None, timeout=60):
     req = urllib.request.Request(CARTESIA_API + path, data=data, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
+
 
 def cartesia_list_voices(api_key):
     """Return [{'id','name'}] for every custom (owned) voice in the account."""
@@ -730,30 +776,72 @@ def cartesia_list_voices(api_key):
     voices.sort(key=lambda v: v["name"].lower())
     return voices
 
-def cartesia_speak(api_key, voice_id, text, speed=1.0):
+
+def cartesia_probe_models(api_key, voice_id):
+    """Return the candidate model ids this key can use (probed concurrently)."""
+    import urllib.error
+    from concurrent.futures import ThreadPoolExecutor
+
+    def probe(model):
+        body = {"model_id": model, "transcript": "", "voice": {"mode": "id", "id": voice_id},
+                "language": "en", "output_format": {"container": "raw", "encoding": "pcm_f32le", "sample_rate": 44100}}
+        try:
+            _cartesia_request("/tts/bytes", api_key, body, timeout=15)
+            return model
+        except urllib.error.HTTPError as e:
+            return model if e.code not in (404, 401, 403) else None
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        found = [m for m in ex.map(probe, CARTESIA_MODEL_CANDIDATES) if m]
+    return found
+
+
+def cartesia_scan(api_key):
+    """Validate a key and fetch its custom voices + usable models."""
+    voices = cartesia_list_voices(api_key)
+    probe_voice = voices[0]["id"] if voices else None
+    if not probe_voice:  # fall back to any public voice just to probe model availability
+        page = json.loads(_cartesia_request("/voices?limit=1", api_key, timeout=20))
+        data = page.get("data", [])
+        probe_voice = data[0]["id"] if data else None
+    models = cartesia_probe_models(api_key, probe_voice) if probe_voice else []
+    return {"voices": voices, "models": models or [DEFAULT_CARTESIA_MODEL]}
+
+
+def cartesia_speak(api_key, voice_id, text, speed=1.0, model=DEFAULT_CARTESIA_MODEL):
     """Synthesize via Cartesia; returns (float32 samples, sample_rate)."""
     import urllib.error
     sr = 44100
     body = {
-        "model_id": CARTESIA_MODEL,
+        "model_id": model,
         "transcript": text,
         "voice": {"mode": "id", "id": voice_id},
         "language": "en",
         "output_format": {"container": "raw", "encoding": "pcm_f32le", "sample_rate": sr},
     }
+    speed_key = None
     if abs(speed - 1.0) > 0.05:
-        body["__experimental_controls"] = {"speed": max(-1.0, min(1.0, speed - 1.0))}
+        if model.startswith("sonic-3"):
+            body["generation_config"] = {"speed": max(0.6, min(1.5, speed))}
+            speed_key = "generation_config"
+        else:
+            body["__experimental_controls"] = {"speed": max(-1.0, min(1.0, speed - 1.0))}
+            speed_key = "__experimental_controls"
     try:
         raw = _cartesia_request("/tts/bytes", api_key, body)
     except urllib.error.HTTPError as e:
-        if e.code == 400 and "__experimental_controls" in body:
-            body.pop("__experimental_controls")
+        if e.code == 400 and speed_key:
+            body.pop(speed_key)
             try:
                 raw = _cartesia_request("/tts/bytes", api_key, body)
             except urllib.error.HTTPError as e2:
                 raise RuntimeError(f"Cartesia error {e2.code}")
         elif e.code in (401, 403):
             raise RuntimeError("Invalid Cartesia key")
+        elif e.code == 404:
+            raise RuntimeError("Cartesia model/voice not found")
         else:
             raise RuntimeError(f"Cartesia error {e.code}")
     return np.frombuffer(raw, dtype=np.float32).copy(), sr
@@ -854,6 +942,18 @@ class ChromeBridgeHandler(BaseHTTPRequestHandler):
         self.send_cors_headers()
         self.end_headers()
 
+    @staticmethod
+    def _all_voices():
+        """Kokoro voices plus the active Cartesia key's custom voices (never exposes keys)."""
+        voices = dict(VOICES)
+        app = GLOBAL_APP_INSTANCE
+        if app:
+            ck = app._cartesia_key()
+            if ck:
+                for v in app._cartesia_cache(ck["id"]).get("voices", []):
+                    voices[CARTESIA_PREFIX + v["id"]] = "Cartesia · " + v["name"]
+        return voices
+
     def do_GET(self):
         if self.path == "/health" or self.path == "/":
             self.send_response(200)
@@ -863,7 +963,8 @@ class ChromeBridgeHandler(BaseHTTPRequestHandler):
             resp = {
                 "status": "online",
                 "ready": GLOBAL_APP_INSTANCE is not None and GLOBAL_APP_INSTANCE.tts.ready,
-                "voices": VOICES,
+                "voices": self._all_voices(),
+                "active_voice": GLOBAL_APP_INSTANCE.settings.get("voice", "af_bella") if GLOBAL_APP_INSTANCE else "af_bella",
                 "theme": GLOBAL_APP_INSTANCE.current_theme_key if GLOBAL_APP_INSTANCE else "oled-cyberdeck",
                 "theme_name": GLOBAL_APP_INSTANCE.theme["name"] if GLOBAL_APP_INSTANCE else "OLED Cyberdeck",
                 "theme_colors": GLOBAL_APP_INSTANCE.theme if GLOBAL_APP_INSTANCE else {},
@@ -918,6 +1019,22 @@ class ChromeBridgeHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
 
+        if self.path == "/voice":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                data = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                voice = data.get("voice", "")
+                if GLOBAL_APP_INSTANCE and voice in self._all_voices():
+                    GLOBAL_APP_INSTANCE.msg_queue.put(("set_voice", voice))
+                self.send_response(200)
+                self.send_cors_headers()
+                self.end_headers()
+            except Exception:
+                self.send_response(500)
+                self.send_cors_headers()
+                self.end_headers()
+            return
+
         if self.path == "/stop":
             if GLOBAL_APP_INSTANCE:
                 GLOBAL_APP_INSTANCE.msg_queue.put(("stop_speaking",))
@@ -937,7 +1054,7 @@ class ChromeBridgeHandler(BaseHTTPRequestHandler):
                 data = json.loads(body) if body else {}
 
                 text = data.get("text", "").strip()
-                voice = data.get("voice", "af_bella")
+                voice = data.get("voice") or None  # None = use the desktop app's active voice
                 speed = float(data.get("speed", 1.0))
 
                 if not text:
@@ -1491,8 +1608,16 @@ class SpeakAnywhereApp:
                             lambda: self._set_state(self.STATE_READY, "READY")
                             if self.state == self.STATE_READY else None,
                         )
+                elif kind == "set_voice":
+                    self.settings["voice"] = msg[1]
+                    if not msg[1].startswith(CARTESIA_PREFIX):
+                        self.settings["kokoro_voice"] = msg[1]
+                    save_settings(self.settings)
+                    log_event(f"voice -> {msg[1][:18]} (via extension)")
+                    if self.panel and self.panel.winfo_exists():
+                        self._sync_voice_dropdowns()
                 elif kind == "cartesia_result":
-                    self._apply_cartesia_result(msg[1], msg[2])
+                    self._apply_cartesia_result(msg[1], msg[2], msg[3])
                 elif kind == "stop_speaking":
                     self._stop_speaking()
                 elif kind == "shuffle_theme":
@@ -1571,8 +1696,16 @@ class SpeakAnywhereApp:
                 if i == 0:
                     self.msg_queue.put(("state", self.STATE_GENERATING, f"GEN {i+1}/{len(chunks)}"))
                 if voice.startswith(CARTESIA_PREFIX):
-                    samples, sr = cartesia_speak(load_cartesia_key(), voice[len(CARTESIA_PREFIX):], chunk, speed)
+                    ck = self._cartesia_key()
+                    if not ck:
+                        raise RuntimeError("No Cartesia key")
+                    model = self.settings.get("cartesia_model", DEFAULT_CARTESIA_MODEL)
+                    if i == 0:
+                        log_event(f"speak: cartesia model={model} voice={voice[len(CARTESIA_PREFIX):][:8]}")
+                    samples, sr = cartesia_speak(ck["key"], voice[len(CARTESIA_PREFIX):], chunk, speed, model)
                 else:
+                    if i == 0:
+                        log_event(f"speak: kokoro voice={voice}")
                     samples, sr = self.tts.speak(chunk, voice=voice, speed=speed)
                 if gen_id != self._current_gen_id or self.state not in (self.STATE_GENERATING, self.STATE_SPEAKING):
                     return
@@ -1685,8 +1818,7 @@ class SpeakAnywhereApp:
         # Voice Selector
         tk.Label(pf, text="VOICE PROFILE:", font=FONT_SM, fg=self.fg_muted, bg=self.bg).pack(anchor="w")
         self.voice_var = tk.StringVar()
-        cur_voice = self.settings.get("voice", "af_bella")
-        self.voice_var.set(VOICES.get(cur_voice, VOICE_LABELS[1]))
+        self.cart_voice_var = None  # filled in by _build_cartesia_ui; keeps the sync helper safe
 
         combo = ttk.Combobox(pf, textvariable=self.voice_var, values=VOICE_LABELS,
                              state="readonly", width=30, style="Cyber.TCombobox")
@@ -1764,16 +1896,9 @@ class SpeakAnywhereApp:
                 self.apply_theme(k)
                 break
 
-    def _on_voice_change(self, event=None):
-        label = self.voice_var.get()
-        idx = VOICE_LABELS.index(label) if label in VOICE_LABELS else 0
-        self.settings["voice"] = VOICE_KEYS[idx]
-        save_settings(self.settings)
-        if getattr(self, "cart_voice_var", None) is not None:
-            self.cart_voice_var.set(self.CART_NONE)
-
-    # ── Cartesia custom voices ──
+    # ── API keys + Cartesia voices/models ──
     CART_NONE = "— Kokoro voice (above) —"
+    KOKORO_NONE = "— using Cartesia voice —"
 
     def _cart_btn(self, parent, text, cmd):
         b = tk.Label(parent, text=text, font=FONT_SM, fg=self.accent, bg=self.bg_panel,
@@ -1783,125 +1908,316 @@ class SpeakAnywhereApp:
         b.bind("<Leave>", lambda e: b.configure(bg=self.bg_panel))
         return b
 
+    def _focus_entry(self, entry):
+        # The HUD is a borderless no-activate window: grab focus explicitly so typing/pasting works.
+        entry.bind("<Button-1>", lambda e: entry.focus_force())
+
+    def _active_key(self):
+        kid = self.settings.get("active_key_id")
+        keys = load_keys()
+        for k in keys:
+            if k["id"] == kid:
+                return k
+        return keys[0] if keys else None
+
+    def _cartesia_key(self):
+        k = self._active_key()
+        return k if k and k["provider"] == "Cartesia" else None
+
+    def _cartesia_cache(self, key_id):
+        return self.settings.get("cartesia_cache", {}).get(key_id, {"voices": [], "models": []})
+
     def _build_cartesia_ui(self):
-        """(Re)build the Cartesia block: key field always, voice dropdown only when a key is stored."""
+        """(Re)build: API KEYS dropdown, collapsible SAVED KEYS, then model/voice dropdowns for a Cartesia key."""
         fr = self.cart_frame
         for w in fr.winfo_children():
             w.destroy()
-        has_key = bool(load_cartesia_key())
+        keys = load_keys()
+        active = self._active_key()
+        if active:
+            self.settings["active_key_id"] = active["id"]
 
-        tk.Label(fr, text="CARTESIA API KEY:", font=FONT_SM, fg=self.fg_muted, bg=self.bg).pack(anchor="w")
-        row = tk.Frame(fr, bg=self.bg)
-        row.pack(anchor="w", fill="x", pady=(3, 4))
-        self.cart_key_var = tk.StringVar()
-        entry = tk.Entry(row, textvariable=self.cart_key_var, show="•", width=24, font=FONT_SM,
-                         fg=self.fg, bg=self.bg_panel, insertbackground=self.accent,
-                         relief="solid", bd=1)
-        if has_key:
-            entry.insert(0, "")
-            entry.configure(fg=self.fg_muted)
-        entry.pack(side="left", padx=(0, 6), ipady=2)
-        # The HUD is a borderless no-activate window: grab focus explicitly so typing/pasting works.
-        entry.bind("<Button-1>", lambda e: entry.focus_force())
-        entry.bind("<Return>", lambda e: self._save_cartesia_key())
-        self.cart_entry = entry
-        self._cart_btn(row, "SAVE", self._save_cartesia_key).pack(side="left", padx=(0, 4))
-        if has_key:
-            self._cart_btn(row, "CLEAR", self._clear_cartesia_key).pack(side="left")
+        # API KEYS dropdown (any provider)
+        tk.Label(fr, text="API KEYS:", font=FONT_SM, fg=self.fg_muted, bg=self.bg).pack(anchor="w")
+        self.keys_var = tk.StringVar(value=key_label(active) if active else "(no saved keys)")
+        self.keys_combo = ttk.Combobox(fr, textvariable=self.keys_var, state="readonly", width=30,
+                                       style="Cyber.TCombobox", values=[key_label(k) for k in keys])
+        self.keys_combo.pack(anchor="w", pady=(3, 4))
+        self.keys_combo.bind("<<ComboboxSelected>>", self._on_key_selected)
 
-        self.cart_status = tk.Label(fr, text=("Key saved — paste a new one to replace" if has_key else ""),
-                                    font=FONT_SM, fg=self.fg_muted, bg=self.bg, anchor="w")
-        self.cart_status.pack(anchor="w", pady=(0, 6))
+        # Collapsible SAVED KEYS
+        open_ = getattr(self, "_keys_open", False)
+        hdr = tk.Label(fr, text=("▾ SAVED KEYS" if open_ else "▸ SAVED KEYS") + f" ({len(keys)})",
+                       font=FONT_SM, fg=self.accent, bg=self.bg, cursor="hand2")
+        hdr.pack(anchor="w", pady=(0, 3))
+        hdr.bind("<Button-1>", lambda e: self._toggle_saved_keys())
+        self.cart_status = tk.Label(fr, text="", font=FONT_SM, fg=self.fg_muted, bg=self.bg,
+                                    anchor="w", wraplength=300, justify="left")
+        if open_:
+            box = tk.Frame(fr, bg=self.bg_panel, padx=6, pady=6, relief="solid", bd=1)
+            box.pack(anchor="w", fill="x", pady=(0, 6))
+            self._sel_key_id = None
+            self.keys_list = tk.Listbox(box, height=min(max(len(keys), 1), 5), font=FONT_SM, exportselection=False,
+                                        bg=self.bg, fg=self.fg, selectbackground=self.accent,
+                                        selectforeground=self.bg, highlightthickness=0, bd=0)
+            for k in keys:
+                self.keys_list.insert("end", key_label(k))
+            self.keys_list.pack(fill="x", pady=(0, 6))
+            self.keys_list.bind("<<ListboxSelect>>", self._on_saved_key_pick)
 
-        if not has_key:
-            return
+            tk.Label(box, text="NAME:", font=FONT_SM, fg=self.fg_muted, bg=self.bg_panel).pack(anchor="w")
+            self.key_name_var = tk.StringVar()
+            e1 = tk.Entry(box, textvariable=self.key_name_var, width=32, font=FONT_SM, fg=self.fg, bg=self.bg,
+                          insertbackground=self.accent, relief="solid", bd=1)
+            e1.pack(anchor="w", pady=(2, 4), ipady=2)
+            self._focus_entry(e1)
+            tk.Label(box, text="PROVIDER:", font=FONT_SM, fg=self.fg_muted, bg=self.bg_panel).pack(anchor="w")
+            self.key_provider_var = tk.StringVar(value=PROVIDERS[0])
+            ttk.Combobox(box, textvariable=self.key_provider_var, values=PROVIDERS, state="readonly",
+                         width=14, style="Cyber.TCombobox").pack(anchor="w", pady=(2, 4))
+            tk.Label(box, text="API KEY (paste):", font=FONT_SM, fg=self.fg_muted, bg=self.bg_panel).pack(anchor="w")
+            self.key_value_var = tk.StringVar()
+            e2 = tk.Entry(box, textvariable=self.key_value_var, show="•", width=32, font=FONT_SM, fg=self.fg,
+                          bg=self.bg, insertbackground=self.accent, relief="solid", bd=1)
+            e2.pack(anchor="w", pady=(2, 6), ipady=2)
+            self._focus_entry(e2)
+            e2.bind("<Return>", lambda e: self._save_key())
+            btns = tk.Frame(box, bg=self.bg_panel)
+            btns.pack(anchor="w")
+            self._cart_btn(btns, "SAVE", self._save_key).pack(side="left", padx=(0, 4))
+            self._cart_btn(btns, "RENAME", self._rename_key).pack(side="left", padx=(0, 4))
+            self.del_btn = self._cart_btn(btns, "DELETE", self._delete_key)
+            self.del_btn.pack(side="left")
+            tk.Label(box, text="SAVE adds a key (same name = replace its key).\nSelect a key, edit NAME, then RENAME.",
+                     font=FONT_SM, fg=self.fg_muted, bg=self.bg_panel, justify="left").pack(anchor="w", pady=(6, 0))
+        self.cart_status.pack(anchor="w", pady=(0, 4))
 
-        tk.Label(fr, text="CARTESIA CUSTOM VOICES:", font=FONT_SM, fg=self.fg_muted, bg=self.bg).pack(anchor="w")
-        vrow = tk.Frame(fr, bg=self.bg)
-        vrow.pack(anchor="w", fill="x", pady=(3, 10))
-        self.cart_voice_var = tk.StringVar()
-        self.cart_combo = ttk.Combobox(vrow, textvariable=self.cart_voice_var, state="readonly",
-                                       width=26, style="Cyber.TCombobox")
-        self.cart_combo.pack(side="left", padx=(0, 6))
-        self.cart_combo.bind("<<ComboboxSelected>>", self._on_cartesia_voice_change)
-        self._cart_btn(vrow, "⟳ REFRESH", self._refresh_cartesia_voices).pack(side="left")
-        self._fill_cartesia_combo()
+        # Model + custom voices (Cartesia keys only)
+        self.cart_voice_var = None
+        ck = self._cartesia_key()
+        if ck:
+            cache = self._cartesia_cache(ck["id"])
+            tk.Label(fr, text="CARTESIA MODEL:", font=FONT_SM, fg=self.fg_muted, bg=self.bg).pack(anchor="w")
+            self.model_var = tk.StringVar(value=self.settings.get("cartesia_model", DEFAULT_CARTESIA_MODEL))
+            models = cache["models"] or [self.model_var.get()]
+            mcombo = ttk.Combobox(fr, textvariable=self.model_var, values=models, state="readonly",
+                                  width=30, style="Cyber.TCombobox")
+            mcombo.pack(anchor="w", pady=(3, 8))
+            mcombo.bind("<<ComboboxSelected>>", self._on_model_change)
 
-    def _fill_cartesia_combo(self):
-        voices = self.settings.get("cartesia_voices", [])
-        names, seen = [], {}
-        for v in voices:
-            n = v["name"]
-            seen[n] = seen.get(n, 0) + 1
-            names.append(n if seen[n] == 1 else f"{n} ({seen[n]})")
-        self._cart_ids = [v["id"] for v in voices]
-        self.cart_combo.configure(values=[self.CART_NONE] + names)
-        cur = self.settings.get("voice", "")
-        if cur.startswith(CARTESIA_PREFIX) and cur[len(CARTESIA_PREFIX):] in self._cart_ids:
-            self.cart_voice_var.set(names[self._cart_ids.index(cur[len(CARTESIA_PREFIX):])])
+            tk.Label(fr, text="CARTESIA CUSTOM VOICES:", font=FONT_SM, fg=self.fg_muted, bg=self.bg).pack(anchor="w")
+            vrow = tk.Frame(fr, bg=self.bg)
+            vrow.pack(anchor="w", fill="x", pady=(3, 10))
+            self.cart_voice_var = tk.StringVar()
+            self.cart_combo = ttk.Combobox(vrow, textvariable=self.cart_voice_var, state="readonly",
+                                           width=26, style="Cyber.TCombobox")
+            self.cart_combo.pack(side="left", padx=(0, 6))
+            self.cart_combo.bind("<<ComboboxSelected>>", self._on_cartesia_voice_change)
+            self._cart_btn(vrow, "⟳ REFRESH", self._refresh_cartesia).pack(side="left")
+            self._cart_names = []
+            voices = cache["voices"]
+            seen = {}
+            for v in voices:
+                seen[v["name"]] = seen.get(v["name"], 0) + 1
+                self._cart_names.append(v["name"] if seen[v["name"]] == 1 else f"{v['name']} ({seen[v['name']]})")
+            self._cart_ids = [v["id"] for v in voices]
+            self.cart_combo.configure(values=[self.CART_NONE] + self._cart_names)
+            if not voices and not getattr(self, "_scanning", False):
+                self._start_scan(ck)
+        self._sync_voice_dropdowns()
+
+    def _sync_voice_dropdowns(self):
+        """Single source of truth = settings['voice']; show it in exactly one dropdown."""
+        cur = self.settings.get("voice", "af_bella")
+        if cur.startswith(CARTESIA_PREFIX):
+            vid = cur[len(CARTESIA_PREFIX):]
+            self.voice_var.set(self.KOKORO_NONE)
+            if self.cart_voice_var is not None:
+                if vid in self._cart_ids:
+                    self.cart_voice_var.set(self._cart_names[self._cart_ids.index(vid)])
+                else:
+                    self.cart_voice_var.set("(selected voice — press REFRESH)")
         else:
-            self.cart_voice_var.set(self.CART_NONE)
+            self.voice_var.set(VOICES.get(cur, VOICES["af_bella"]))
+            if self.cart_voice_var is not None:
+                self.cart_voice_var.set(self.CART_NONE)
+
+    def _on_voice_change(self, event=None):
+        label = self.voice_var.get()
+        if label not in VOICE_LABELS:
+            return
+        key = VOICE_KEYS[VOICE_LABELS.index(label)]
+        self.settings["voice"] = key
+        self.settings["kokoro_voice"] = key
+        save_settings(self.settings)
+        log_event(f"voice -> kokoro:{key}")
+        self._sync_voice_dropdowns()
 
     def _on_cartesia_voice_change(self, event=None):
         idx = self.cart_combo.current() - 1  # index 0 is the "use Kokoro" entry
         if 0 <= idx < len(self._cart_ids):
             self.settings["voice"] = CARTESIA_PREFIX + self._cart_ids[idx]
+            log_event(f"voice -> cartesia:{self._cart_names[idx]}")
+        elif self.cart_combo.current() == 0:
+            self.settings["voice"] = self.settings.get("kokoro_voice", "af_bella")
+            log_event(f"voice -> kokoro:{self.settings['voice']} (via Cartesia dropdown)")
         else:
-            self.settings["voice"] = VOICE_KEYS[VOICE_LABELS.index(self.voice_var.get())] \
-                if self.voice_var.get() in VOICE_LABELS else "af_bella"
+            return
         save_settings(self.settings)
+        self._sync_voice_dropdowns()
+
+    def _on_model_change(self, event=None):
+        self.settings["cartesia_model"] = self.model_var.get()
+        save_settings(self.settings)
+        log_event(f"cartesia model -> {self.settings['cartesia_model']}")
+
+    def _on_key_selected(self, event=None):
+        keys = load_keys()
+        idx = self.keys_combo.current()
+        if 0 <= idx < len(keys):
+            self.settings["active_key_id"] = keys[idx]["id"]
+            save_settings(self.settings)
+            log_event(f"active key -> {keys[idx]['name']} ({keys[idx]['provider']})")
+            self._build_cartesia_ui()
+
+    def _toggle_saved_keys(self):
+        self._keys_open = not getattr(self, "_keys_open", False)
+        self._build_cartesia_ui()
+
+    def _on_saved_key_pick(self, event=None):
+        sel = self.keys_list.curselection()
+        keys = load_keys()
+        if sel and sel[0] < len(keys):
+            k = keys[sel[0]]
+            self._sel_key_id = k["id"]
+            self.key_name_var.set(k["name"])
+            self.key_provider_var.set(k["provider"])
+            self.key_value_var.set("")
 
     def _set_cart_status(self, text, error=False):
         try:
             if self.panel and self.panel.winfo_exists() and self.cart_status.winfo_exists():
-                self.cart_status.configure(text=text, fg=(self.fg if not error else "#ff5555"))
+                self.cart_status.configure(text=text, fg=("#ff5555" if error else self.fg))
         except Exception:
             pass
 
-    def _save_cartesia_key(self):
-        key = self.cart_key_var.get().strip()
-        if not key:
-            self._set_cart_status("Paste your Cartesia API key first", error=True)
+    def _save_key(self):
+        name = self.key_name_var.get().strip()
+        provider = self.key_provider_var.get()
+        value = self.key_value_var.get().strip()
+        if not value:
+            self._set_cart_status("Paste an API key first", error=True)
             return
-        self._set_cart_status("Checking key & scanning voices…")
-        threading.Thread(target=self._scan_cartesia, args=(key,), daemon=True).start()
-
-    def _refresh_cartesia_voices(self):
-        key = load_cartesia_key()
-        if key:
-            self._set_cart_status("Scanning voices…")
-            threading.Thread(target=self._scan_cartesia, args=(key,), daemon=True).start()
-
-    def _scan_cartesia(self, key):
-        try:
-            voices = cartesia_list_voices(key)
-        except Exception as e:
-            self.msg_queue.put(("cartesia_result", None, str(e)))
+        keys = load_keys()
+        if not name:
+            name = f"{provider} {len([k for k in keys if k['provider'] == provider]) + 1}"
+        existing = next((k for k in keys if k["name"].lower() == name.lower() and k["provider"] == provider), None)
+        if existing:
+            existing["key"] = value
+            entry = existing
+        else:
+            entry = {"id": uuid.uuid4().hex[:8], "name": name, "provider": provider, "key": value}
+            keys.append(entry)
+        if not save_keys(keys):
+            self._set_cart_status("Could not write secrets.json", error=True)
             return
-        self.msg_queue.put(("cartesia_result", (key, voices), ""))
-
-    def _apply_cartesia_result(self, result, err):
-        if result is None:
-            self._set_cart_status(err, error=True)
-            return
-        key, voices = result
-        save_cartesia_key(key)
-        self.settings["cartesia_voices"] = voices
+        self.settings["active_key_id"] = entry["id"]
         save_settings(self.settings)
+        log_event(f"key saved: {entry['name']} ({provider})")
+        self._build_cartesia_ui()
+        if provider == "Cartesia":
+            self._set_cart_status(f"Saved “{entry['name']}” — fetching models & voices…")
+            self._start_scan(entry)
+        else:
+            self._set_cart_status(f"Saved “{entry['name']}”")
+
+    def _rename_key(self):
+        name = self.key_name_var.get().strip()
+        keys = load_keys()
+        target = next((k for k in keys if k["id"] == getattr(self, "_sel_key_id", None)), None)
+        if not target:
+            self._set_cart_status("Select a saved key to rename", error=True)
+            return
+        if not name:
+            self._set_cart_status("Enter a new name", error=True)
+            return
+        target["name"] = name
+        save_keys(keys)
+        log_event(f"key renamed -> {name}")
+        self._build_cartesia_ui()
+        self._set_cart_status(f"Renamed to “{name}”")
+
+    def _delete_key(self):
+        kid = getattr(self, "_sel_key_id", None)
+        keys = load_keys()
+        target = next((k for k in keys if k["id"] == kid), None)
+        if not target:
+            self._set_cart_status("Select a saved key to delete", error=True)
+            return
+        if getattr(self, "_confirm_del", None) != kid:  # two-click confirm
+            self._confirm_del = kid
+            self.del_btn.configure(text="CONFIRM?")
+            self.root.after(3000, self._reset_del_btn)
+            return
+        self._confirm_del = None
+        save_keys([k for k in keys if k["id"] != kid])
+        self.settings.get("cartesia_cache", {}).pop(kid, None)
+        if self.settings.get("active_key_id") == kid:
+            self.settings["active_key_id"] = None
+            if self.settings.get("voice", "").startswith(CARTESIA_PREFIX):
+                self.settings["voice"] = self.settings.get("kokoro_voice", "af_bella")
+        save_settings(self.settings)
+        log_event(f"key deleted: {target['name']}")
+        self._build_cartesia_ui()
+        self._set_cart_status(f"Deleted “{target['name']}”")
+
+    def _reset_del_btn(self):
+        self._confirm_del = None
+        try:
+            self.del_btn.configure(text="DELETE")
+        except Exception:
+            pass
+
+    def _startup_scan(self):
+        """Populate the voice/model cache for the active Cartesia key so the extension and panel have it immediately."""
+        ck = self._cartesia_key()
+        if ck and not self._cartesia_cache(ck["id"])["voices"] and not getattr(self, "_scanning", False):
+            self._start_scan(ck)
+
+    def _refresh_cartesia(self):
+        ck = self._cartesia_key()
+        if ck:
+            self._set_cart_status("Fetching models & voices…")
+            self._start_scan(ck)
+
+    def _start_scan(self, key_entry):
+        self._scanning = True
+        threading.Thread(target=self._scan_cartesia, args=(key_entry["id"], key_entry["key"]), daemon=True).start()
+
+    def _scan_cartesia(self, key_id, key):
+        try:
+            result = cartesia_scan(key)
+        except Exception as e:
+            self.msg_queue.put(("cartesia_result", key_id, None, str(e)))
+            return
+        self.msg_queue.put(("cartesia_result", key_id, result, ""))
+
+    def _apply_cartesia_result(self, key_id, result, err):
+        self._scanning = False
+        if result is None:
+            log_event(f"scan failed: {err}")
+            self._set_cart_status(f"Key saved, but: {err}", error=True)
+            return
+        self.settings.setdefault("cartesia_cache", {})[key_id] = result
+        if self.settings.get("cartesia_model") not in result["models"]:
+            self.settings["cartesia_model"] = (DEFAULT_CARTESIA_MODEL if DEFAULT_CARTESIA_MODEL in result["models"]
+                                               else result["models"][0])
+        save_settings(self.settings)
+        log_event(f"scan ok: {len(result['voices'])} voices, models={result['models']}")
         if self.panel and self.panel.winfo_exists():
             self._build_cartesia_ui()
-            self._set_cart_status(f"Key saved — {len(voices)} custom voice{'s' if len(voices) != 1 else ''} found")
-
-    def _clear_cartesia_key(self):
-        save_cartesia_key("")
-        self.settings["cartesia_voices"] = []
-        if self.settings.get("voice", "").startswith(CARTESIA_PREFIX):
-            self.settings["voice"] = VOICE_KEYS[VOICE_LABELS.index(self.voice_var.get())] \
-                if self.voice_var.get() in VOICE_LABELS else "af_bella"
-        save_settings(self.settings)
-        self.cart_voice_var = None
-        self._build_cartesia_ui()
-        self._set_cart_status("Key removed")
+            nv, nm = len(result["voices"]), len(result["models"])
+            self._set_cart_status(f"Found {nv} custom voice{'s' if nv != 1 else ''} and {nm} model{'s' if nm != 1 else ''}")
 
     def _on_speed_change(self, val=None):
         speed = round(self.speed_var.get(), 1)
@@ -1958,6 +2274,7 @@ class SpeakAnywhereApp:
         sys.exit(0)
 
     def run(self):
+        self.root.after(2500, self._startup_scan)
         self.root.mainloop()
 
 

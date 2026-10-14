@@ -12,5 +12,6 @@ python3*.dll
 vcruntime*.dll
 pyvenv.cfg
 secrets.json
+speakanywhere.log
 settings.json
 __pycache__/
